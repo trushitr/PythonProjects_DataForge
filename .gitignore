@@ -11,6 +11,8 @@ __pycache__/
 !.env.example
 
 # Databases
+# backend/data holds the SQLite database (plus -journal/-wal files) and the generated JWT signing secret
+backend/data/
 *.db
 *.sqlite
 *.sqlite3

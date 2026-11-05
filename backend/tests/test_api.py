@@ -1,13 +1,14 @@
 import io
-import os
-import tempfile
-from pathlib import Path
 
-os.environ["DATAFORGE_DATA_DIR"] = tempfile.mkdtemp(prefix="dataforge-test-")
 from fastapi.testclient import TestClient
 from app.main import app
 
+# Import endpoints require a logged-in user; the temp data dir and JWT secret
+# are set in conftest.py.
 client = TestClient(app)
+client.post("/api/auth/register", json={"email": "api-tests@example.com", "password": "test-password"})
+_token = client.post("/api/auth/login", data={"username": "api-tests@example.com", "password": "test-password"}).json()["access_token"]
+client.headers["Authorization"] = f"Bearer {_token}"
 
 def test_health():
     assert client.get("/health").json() == {"status": "ok"}
