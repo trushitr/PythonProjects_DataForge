@@ -3,11 +3,10 @@ from __future__ import annotations
 import csv
 import io
 import json
+import logging
 import os
 import re
-import sqlite3
 import uuid
-from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -17,34 +16,23 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from openpyxl import load_workbook
 
+from .auth import CurrentUser, router as auth_router
+from .db import DATA_DIR, DB_PATH, count_legacy_imports, db, init_db
+
 MAX_BYTES = 5 * 1024 * 1024
-DATA_DIR = Path(os.getenv("DATAFORGE_DATA_DIR", Path(__file__).resolve().parents[1] / "data"))
-DATA_DIR.mkdir(parents=True, exist_ok=True)
-DB_PATH = DATA_DIR / "dataforge.db"
 
 app = FastAPI(title="DataForge API", version="0.1.0")
 app.add_middleware(CORSMiddleware, allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"], allow_methods=["GET", "POST"], allow_headers=["*"])
-
-@contextmanager
-def db():
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    try:
-        yield conn
-        conn.commit()
-    finally:
-        conn.close()
-
-def init_db():
-    with db() as conn:
-        conn.execute("""CREATE TABLE IF NOT EXISTS imports (
-            id TEXT PRIMARY KEY, filename TEXT NOT NULL, created_at TEXT NOT NULL,
-            total_rows INTEGER NOT NULL, valid_rows INTEGER NOT NULL,
-            invalid_rows INTEGER NOT NULL, duplicate_rows INTEGER NOT NULL,
-            columns_json TEXT NOT NULL, results_json TEXT NOT NULL
-        )""")
+app.include_router(auth_router)
 
 init_db()
+if legacy := count_legacy_imports():
+    logging.getLogger("dataforge").warning(
+        "%d import(s) from before user accounts have no owner and are hidden from all users. "
+        "Assign them with: python -m app.assign_legacy --email <owner email>", legacy)
+
+# Columns returned to clients. user_id is deliberately excluded.
+SUMMARY_COLUMNS = "id, filename, created_at, total_rows, valid_rows, invalid_rows, duplicate_rows"
 
 def parse_file(filename: str, content: bytes) -> tuple[list[str], list[dict[str, Any]]]:
     ext = Path(filename).suffix.lower()
@@ -104,7 +92,7 @@ def health():
     return {"status": "ok"}
 
 @app.post("/api/imports", status_code=201)
-async def create_import(file: UploadFile = File(...)):
+async def create_import(user: CurrentUser, file: UploadFile = File(...)):
     filename = Path(file.filename or "").name
     if Path(filename).suffix.lower() not in (".csv", ".xlsx"):
         raise HTTPException(400, "Only .csv and .xlsx files are supported")
@@ -122,20 +110,27 @@ async def create_import(file: UploadFile = File(...)):
                "invalid_rows": sum(not r["valid"] for r in results),
                "duplicate_rows": sum(r["duplicate"] for r in results)}
     with db() as conn:
-        conn.execute("INSERT INTO imports VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        conn.execute("""INSERT INTO imports (id, filename, created_at, total_rows, valid_rows, invalid_rows,
+                                             duplicate_rows, columns_json, results_json, user_id)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                      (import_id, filename, now, summary["total_rows"], summary["valid_rows"],
-                      summary["invalid_rows"], summary["duplicate_rows"], json.dumps(columns), json.dumps(results)))
+                      summary["invalid_rows"], summary["duplicate_rows"], json.dumps(columns), json.dumps(results),
+                      user["id"]))
     return summary
 
 @app.get("/api/imports")
-def list_imports():
+def list_imports(user: CurrentUser):
     with db() as conn:
-        rows = conn.execute("SELECT id, filename, created_at, total_rows, valid_rows, invalid_rows, duplicate_rows FROM imports ORDER BY created_at DESC LIMIT 100").fetchall()
+        rows = conn.execute(f"SELECT {SUMMARY_COLUMNS} FROM imports WHERE user_id = ? ORDER BY created_at DESC LIMIT 100",
+                            (user["id"],)).fetchall()
         return [dict(r) for r in rows]
 
-def get_import(import_id: str):
+def get_import(import_id: str, user_id: str):
+    # Ownership is part of the query: another user's import (or a legacy import
+    # with no owner) is indistinguishable from one that does not exist.
     with db() as conn:
-        record = conn.execute("SELECT * FROM imports WHERE id = ?", (import_id,)).fetchone()
+        record = conn.execute(f"SELECT {SUMMARY_COLUMNS}, columns_json, results_json FROM imports WHERE id = ? AND user_id = ?",
+                              (import_id, user_id)).fetchone()
     if record is None:
         raise HTTPException(404, "Import not found")
     item = dict(record)
@@ -144,12 +139,12 @@ def get_import(import_id: str):
     return item
 
 @app.get("/api/imports/{import_id}")
-def import_detail(import_id: str):
-    return get_import(import_id)
+def import_detail(import_id: str, user: CurrentUser):
+    return get_import(import_id, user["id"])
 
 @app.get("/api/imports/{import_id}/report.csv")
-def download_report(import_id: str):
-    item = get_import(import_id)
+def download_report(import_id: str, user: CurrentUser):
+    item = get_import(import_id, user["id"])
     output = io.StringIO()
     writer = csv.writer(output)
     writer.writerow(["source_row", *item["columns"], "valid", "errors"])
